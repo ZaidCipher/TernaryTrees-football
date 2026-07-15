@@ -1,999 +1,298 @@
 """
-agents.py
-=========
-The participant submission policy file.
+agent.py
+========
+Agent dataclass and squad generation with star-player balance guardrails.
 
-You write your policy here.  The engine imports exactly one thing from this
-module -- ``make_policy(squad=None, seed=None)`` -- which must return an
-object exposing ``decide(self, states, team) -> list[action]`` (see
-``agents_example.py`` for the precise contract).
-
-This file ships as a **working starting point**, not a blank stub, so the
-environment is immediately runnable with ``--style-a participant`` and so you
-have a readable reference for the centralized-policy pattern.  It does two
-things:
-
-  1. If you have trained a DQN (see ``train_rl_agent.py``) AND PyTorch is
-     installed AND the weight file for a role exists, that role's actions are
-     produced by the network.  This is optional -- torch is imported lazily so
-     the file runs fine without it.
-  2. Otherwise (no torch, no weights, or a role you haven't trained yet) a
-     solid centralized heuristic drives the squad.  The heuristic is built to
-     *always keep moving*: the carrier dribbles at the opponent's goal, shoots
-     in range, and passes out of pressure; team-mates push forward to support
-     an attack or hold a compact defensive shape.  Nobody stands still spinning
-     on the spot just because the ball is temporarily out of their vision cone
-     -- the policy uses its own squad's positions (proprioception, see the
-     README) to stay organized even when individual agents can't see the ball.
-
-Replace the heuristic with your own logic / trained network as you develop.
-
-────────────────────────────────────────────────────────────────────────────────
-REFERENCE IMPLEMENTATIONS YOU SHOULD READ BEFORE WRITING YOUR OWN
-────────────────────────────────────────────────────────────────────────────────
-This file is NOT just a helper library — it is a complete, working policy with
-correct implementations of every role.  Search for these method names:
-
-  Policy._goalkeeper()   — ball-Y tracking, dive timing, distribution.
-                           ⚠ DO NOT just return DEFLECT (12) or DIVE (11)
-                           every tick.  DEFLECT does not move the GK; DIVE
-                           triggers a cooldown.  The keeper MUST MOVE (0 or 1)
-                           along the goal line.  See the method below.
-
-  Policy._carrier()      — shoot in range, pass out of pressure, dribble.
-  Policy._outfield()     — chase loose balls, support the attack, hold shape.
-  Policy._safeguard()    — prevents a trained DQN from parking players.
-
-The ``map_action`` and ``extract_features`` functions at the top of this file
-are the convenience helpers you import; the ``Policy`` class below them is the
-reference.  Read it before writing your own.
-────────────────────────────────────────────────────────────────────────────────
+Section 3 (Agent Attributes & Squad Allocations):
+  * Each participant gets a squad of 11 unique agents.
+  * Outfield players (positions 1-10) have SHO, SPD, DEF, PASS (1.0-10.0)
+    and VIS (30.0-120.0 degrees).
+  * The Goalkeeper (position 11) has REF, POS, PASS.
+  * Exactly one non-goalkeeper is the "Star Player" with average rating >= 6.0
+    and one priority stat pegged at 10.0 by archetype.
 """
 
 from __future__ import annotations
 
-import math
-import os
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-try:
-    from api import config as C
-    from api.agent import Agent
-    from api.utils import (
-        angle_of_vector, clamp, distance, move_direction_index_to_angle,
-        normalize_angle, vec_from_angle,
-    )
-except ImportError:
-    from fifa_ai_world_cup import config as C  # type: ignore
-    from fifa_ai_world_cup.agent import Agent  # type: ignore
-    from fifa_ai_world_cup.utils import (  # type: ignore
-        angle_of_vector, clamp, distance, move_direction_index_to_angle,
-        normalize_angle, vec_from_angle,
-    )
+from . import config as C
+from .utils import clamp
 
-Point = Tuple[float, float]
 
-# Action type constants (match the engine's action_type strings).
-MOVE, ROTATE, SHOOT, IDLE = "MOVE", "ROTATE", "SHOOT", "IDLE"
-DIVE, DEFLECT = "DIVE", "DEFLECT"
+# Outfield position archetypes map to the attribute that gets boosted to 10.0
+# when the holder is the designated star player (Section 3.3).
+ARCHETYPES = {
+    "GK":        "REF",   # goalkeepers are never stars (SRS: non-GK role)
+    "DEFENDER":  "DEF",
+    "MIDFIELDER":"PASS",
+    "ATTACKER":  "SHO",
+}
+
+# A 4-3-3 formation: 1 GK + 4 defenders + 3 midfielders + 3 attackers.
+FORMATION = [
+    "GK",
+    "DEFENDER", "DEFENDER", "DEFENDER", "DEFENDER",
+    "MIDFIELDER", "MIDFIELDER", "MIDFIELDER",
+    "ATTACKER", "ATTACKER", "ATTACKER",
+]
+
+
+@dataclass
+class Agent:
+    """A single reinforcement-learning entity on the pitch."""
+
+    id: str
+    team: str                 # "A" or "B"
+    index: int                # 0..10 within the squad
+    archetype: str            # GK / DEFENDER / MIDFIELDER / ATTACKER
+    is_gk: bool
+
+    # Outfield attributes (Section 3.1).  Goalkeepers keep these at defaults.
+    # These are internal 1..10 values derived from the participant's knobs.
+    sho: float = 5.0       # shot power       (knob: shot_power)
+    spd: float = 5.0       # running speed    (knob: running)
+    def_: float = 5.0      # tackling/defend  (knob: tackling)
+    pass_: float = 5.0     # passing accuracy (knob: pass_accuracy)
+    vis: float = 75.0      # vision aperture  (knob: vision -> degrees)
+    drb: float = 5.0       # dribbling speed  (knob: dribbling)
+    prg: float = 5.0       # pass range/power (knob: pass_range)
+    vis_range: float = C.VISION_RANGE  # sight distance (knob: vision -> units)
+
+    # Goalkeeper attributes (Section 3.2).  Outfield players keep defaults.
+    ref: float = 5.0        # reflexes / dive recovery  (knob: reflexes)
+    pos: float = 5.0        # positioning / save radius (knob: positioning)
+    gk_agility: float = 5.0  # dive burst distance      (knob: agility)
+    gk_handling: float = 5.0  # catch-vs-parry on saves (knob: handling)
+    gk_dist: float = 5.0    # distribution power/accuracy (knob: distribution)
+
+    is_star: bool = False
+
+    # ---- Dynamic (per-match) state ----------------------------------------
+    x: float = 0.0
+    y: float = 0.0
+    orientation: float = 0.0     # heading in degrees, 0 = East
+    has_ball: bool = False
+    cooldown_remaining: int = 0
+    deflect_angle: float = 0.0   # GK: angle to redirect blocked shots
+
+    # The home position the agent tries to return to when idle.
+    home_x: float = 0.0
+    home_y: float = 0.0
+    # True when home_x/home_y come from a participant's custom formation, so
+    # place_kickoff restores those instead of the built-in default shape.
+    home_set: bool = False
+
+    # ------------------------------------------------------------------ ratings
+    def average_rating(self) -> float:
+        """Average of the agent's *relevant* attributes (used for star guard)."""
+        if self.is_gk:
+            return (self.ref + self.pos + self.pass_) / 3.0
+        return (self.sho + self.spd + self.def_ + self.pass_ + self.vis / 12.0) / 5.0
+
+    def move_speed(self) -> float:
+        """Running speed: displacement per tick when NOT carrying the ball."""
+        if self.is_gk:
+            return C.GK_BASE_SPEED
+        return C.BASE_MOVE_SPEED * self.spd
+
+    def dribble_speed(self) -> float:
+        """Dribbling speed: displacement per tick WHILE carrying the ball."""
+        if self.is_gk:
+            return C.GK_BASE_SPEED
+        return C.BASE_MOVE_SPEED * self.drb
+
+    def gk_dive_speed(self) -> float:
+        """Goalkeeper dive burst distance, scaled by the agility knob."""
+        return C.GK_DIVE_MULTIPLIER * C.GK_BASE_SPEED * (self.gk_agility / 5.0)
+
+    def gk_catch_probability(self) -> float:
+        """Probability a GK save is cleanly caught (else parried loose)."""
+        return max(0.15, min(0.95, 0.2 + 0.075 * self.gk_handling))
+
+    def intercept_radius(self) -> float:
+        """Passive interception envelope (Section 6.2)."""
+        return C.INTERCEPT_RADIUS_BASE * (1.0 + self.def_ / 10.0)
+
+    def gk_block_radius(self) -> float:
+        """Automatic save radius around the keeper (POS), widened for balance."""
+        # Mirrors the intercept formula but keyed on POS and scaled up so the
+        # keeper can realistically deny shots (GK_SAVE_RADIUS_SCALE).
+        return (C.INTERCEPT_RADIUS_BASE * (1.0 + self.pos / 10.0)
+                * C.GK_SAVE_RADIUS_SCALE)
+
+    def dive_speed(self) -> float:
+        """Burst speed for a goalkeeper dive (Section 6.3)."""
+        return C.GK_DIVE_MULTIPLIER * C.GK_BASE_SPEED
+
+    def dive_cooldown(self) -> int:
+        """Mandatory freeze ticks after a dive: max(5, round(35 - REF))."""
+        return max(5, round(35 - self.ref))
+
+    def pass_noise(self) -> float:
+        """Angular spread (degrees) added to kicks, reduced by PASS."""
+        return max(0.0, C.PASS_NOISE_BASE - self.pass_)
+
+    def vision_aperture(self) -> float:
+        """Field-of-view aperture in degrees (the VIS attribute)."""
+        return self.vis
+
+    # ------------------------------------------------------------------ resets
+    def reset_dynamic_state(self) -> None:
+        self.has_ball = False
+        self.cooldown_remaining = 0
+        self.orientation = self._default_orientation()
+        self.deflect_angle = self._default_orientation()
+
+    def _default_orientation(self) -> float:
+        """Team A faces East (toward B's goal), Team B faces West."""
+        return 0.0 if self.team == "A" else 180.0
+
+    def snapshot_position(self):
+        return (self.x, self.y)
 
 
 # ---------------------------------------------------------------------------
-# Optional torch import -- training is the only hard dependency on torch.
-# If torch is unavailable, ``_TORCH`` is None and the policy transparently
-# falls back to the heuristic, so the match still runs.
+# Squad generation
 # ---------------------------------------------------------------------------
-try:  # pragma: no cover - environment-dependent
-    import torch
-    import torch.nn as nn
-    _TORCH = True
-except Exception:  # noqa: BLE001 - torch is optional at runtime
-    torch = None
-    nn = None
-    _TORCH = False
-
-
-# ===========================================================================
-# 1.  Observation / action helpers (shared by the heuristic and the DQN)
-# ===========================================================================
-def _rotate_toward(current: float, target: float) -> float:
-    """Clamped (-30..30 deg) rotation that turns ``current`` toward ``target``."""
-    diff = (target - current + 180.0) % 360.0 - 180.0
-    return max(-30.0, min(30.0, diff))
-
-
-def _compass(angle_deg: float) -> int:
-    a = angle_deg % 360.0
-    return int(round(a / 45.0)) % 8
-
-
-def _polar_to_global(origin: Point, heading: float,
-                     rel_dist: float, rel_angle: float) -> Point:
-    abs_ang = heading + rel_angle
-    dx, dy = vec_from_angle(abs_ang, rel_dist)
-    return (origin[0] + dx, origin[1] + dy)
-
-
-def _kick_power_for_distance(dist: float, sho: float) -> float:
-    """Pass/clearance power: catchable pace that still covers ``dist``."""
-    if sho <= 0:
-        return 1.0
-    return clamp(dist / (20.0 * sho) + 0.05, 0.08, 1.0)
-
-
-def _shot_power_for_distance(dist: float, sho: float) -> float:
-    """Shot-on-goal power: hard, so the ball beats the keeper."""
-    if sho <= 0:
-        return 1.0
-    return clamp(dist / (5.0 * sho) + 0.5, 0.55, 1.0)
-
-
-def _attack_angle(team: str) -> float:
-    return 0.0 if team == "A" else 180.0
-
-
-def _opp_goal(team: str) -> Point:
-    return (C.TEAM_B_GOAL_X, C.FIELD_CENTER_Y) if team == "A" \
-        else (C.TEAM_A_GOAL_X, C.FIELD_CENTER_Y)
-
-
-def _own_goal(team: str) -> Point:
-    return (C.TEAM_A_GOAL_X, C.FIELD_CENTER_Y) if team == "A" \
-        else (C.TEAM_B_GOAL_X, C.FIELD_CENTER_Y)
-
-
-# ===========================================================================
-# 2.  DQN definition (only used when torch + trained weights are present)
-# ===========================================================================
-STATE_DIM = 20
-# 13-action unified space (outfield + GK): 8 MOVE + ROTATE + SHOOT + PASS +
-# DIVE + DEFLECT.  Outfield agents' DIVE/DEFLECT map to IDLE; GKs' SHOOT/PASS
-# still work but DIVE/DEFLECT are keeper-specific.  This lets every slot
-# (including the GK) train with the same interface.
-ACTION_DIM = 13
-
-
-def extract_features(state: Dict[str, Any]) -> "list[float]":
-    """20-dim observation vector -- identical to ``train_rl_agent.py``.
-
-    Keep this in sync with the trainer so a network trained there loads and
-    runs here without surprise.
-    """
-    f: List[float] = []
-    # Proprioception (5)
-    f.append(1.0 if state.get("has_ball") else 0.0)
-    f.append(float(state.get("cooldown_remaining", 0)) / 35.0)
-    ori = math.radians(state.get("current_orientation", 0.0))
-    f.append(math.sin(ori))
-    f.append(math.cos(ori))
-    f.append(float(state.get("gk_y", 30.0)) / 60.0)
-    # Vision sectors (5 x 3 = 15)
-    sectors = list(state.get("vision_sectors", []))
-    while len(sectors) < 5:
-        sectors.append({"distance": None, "type": None})
-    for s in sectors[:5]:
-        d = s.get("distance")
-        f.append(float(d) / 40.0 if d is not None else 1.0)
-        kind = s.get("type")
-        f.append(1.0 if kind == "ball" else 0.0)
-        f.append(1.0 if kind in ("teammate", "opponent") else 0.0)
-    return f
-
-
-def map_action(action_idx: int, state: Dict[str, Any],
-               agent_pos: Optional[Point] = None, sho: float = 5.0) -> Dict[str, Any]:
-    """Discrete action index -> engine action dict (13-action unified space).
-
-    * 0..7  -- MOVE in compass direction ``idx``
-    * 8     -- ROTATE (scan)
-    * 9     -- SHOOT at the opponent goal (aimed away from a visible keeper).
-               If ``agent_pos`` is supplied the shot is aimed precisely from
-               the carrier's position; otherwise it shoots along the heading.
-    * 10    -- PASS to the best visible forward team-mate (dribble if none).
-               ``agent_pos`` enables precise pass angles.
-    * 11    -- DIVE (goalkeeper only; outfielders -> IDLE)
-    * 12    -- DEFLECT (goalkeeper only; outfielders -> IDLE)
-
-    ``agent_pos`` is the controlled agent's absolute (x, y); it is available
-    to a centralized policy (via its squad reference) and to the training loop
-    (via ``TrainingEnv.controlled_agent``), but NOT inside the raw state dict,
-    so callers that have it should pass it for accurate shooting/passing.
-    """
-    ori = state.get("current_orientation", 0.0)
-    team = state.get("team", "A")
-    is_gk = state.get("is_gk", False)
-    if action_idx < 8:
-        target = action_idx * 45.0
-        return {
-            "action_type": MOVE,
-            "move_direction": action_idx,
-            "rotation_angle": _rotate_toward(ori, target),
-            "shoot_power_percentage": 0.0,
-            "shoot_angle": 0.0,
-        }
-    if action_idx == 8:
-        return {"action_type": ROTATE, "move_direction": 0,
-                "rotation_angle": 15.0,
-                "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-    if action_idx == 9:
-        return _shoot_at_goal(state, team, ori, agent_pos, sho)
-    if action_idx == 10:
-        # PASS to the best visible forward team-mate.
-        ang = _pass_angle(state, team, ori, agent_pos)
-        if ang is not None:
-            return {"action_type": SHOOT, "move_direction": 0,
-                    "rotation_angle": _rotate_toward(ori, ang),
-                    "shoot_power_percentage": _kick_power_for_distance(15.0, sho),
-                    "shoot_angle": ang}
-        # No one to pass to: dribble forward.
-        fwd = _attack_angle(team)
-        return {"action_type": MOVE, "move_direction": _compass(fwd),
-                "rotation_angle": _rotate_toward(ori, fwd),
-                "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-    if action_idx == 11:
-        # DIVE — goalkeeper only.  Outfielders idle.
-        if not is_gk:
-            return {"action_type": IDLE, "move_direction": 0,
-                    "rotation_angle": 0.0,
-                    "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-        # Dive toward the ball's bearing (left/right relative to own net).
-        move_dir = _gk_dive_direction(state, team, agent_pos)
-        return {"action_type": DIVE, "move_direction": move_dir,
-                "deflect_angle": _attack_angle(team)}
-    if action_idx == 12:
-        # DEFLECT — goalkeeper only.  Outfielders idle.
-        if not is_gk:
-            return {"action_type": IDLE, "move_direction": 0,
-                    "rotation_angle": 0.0,
-                    "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-        return {"action_type": DEFLECT, "move_direction": 0,
-                "deflect_angle": _attack_angle(team)}
-    # Fallback.
-    return {"action_type": IDLE, "move_direction": 0,
-            "rotation_angle": 0.0,
-            "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-
-
-def _gk_dive_direction(state: Dict[str, Any], team: str,
-                       agent_pos: Optional[Point]) -> int:
-    """Pick the GK dive direction (0=left, 1=right) from the ball bearing."""
-    # Try to read the ball's relative bearing from the GK's vision.
-    for obj in state.get("visible_objects", []):
-        if obj.get("type") == "ball":
-            rel_angle = obj.get("rel_angle", 0.0)
-            # Team A GK: ball to the GK's +Y is "left" relative to own net
-            # (defending X=0, facing East).  move_dir 0 = +Y for team A.
-            if team == "A":
-                return 0 if rel_angle > 0 else 1
-            else:
-                return 1 if rel_angle > 0 else 0
-    # Ball not visible: dive right (arbitrary default).
-    return 1
-
-
-def _shoot_at_goal(state: Dict[str, Any], team: str, ori: float,
-                   agent_pos: Optional[Point], sho: float) -> Dict[str, Any]:
-    opp = _opp_goal(team)
-    if agent_pos is None:
-        # No absolute position: shoot along the current heading.
-        return {"action_type": SHOOT, "move_direction": 0,
-                "rotation_angle": 0.0,
-                "shoot_power_percentage": 0.85, "shoot_angle": ori}
-    # Aim at the goal corner farthest from a visible goalkeeper.
-    target_y = opp[1]
-    gk_y = _visible_keeper_y(state, ori, agent_pos)
-    if gk_y is not None:
-        target_y = (C.GOAL_Y_MIN + 1.0) if gk_y > C.FIELD_CENTER_Y \
-            else (C.GOAL_Y_MAX - 1.0)
-    shot_ang = angle_of_vector((opp[0] - agent_pos[0], target_y - agent_pos[1]))
-    d = distance(agent_pos, opp)
-    return {"action_type": SHOOT, "move_direction": 0,
-            "rotation_angle": _rotate_toward(ori, shot_ang),
-            "shoot_power_percentage": _shot_power_for_distance(d, sho),
-            "shoot_angle": shot_ang}
-
-
-def _pass_angle(state: Dict[str, Any], team: str, ori: float,
-                agent_pos: Optional[Point]) -> Optional[float]:
-    """Absolute angle to the best visible forward team-mate, or None."""
-    atk = 1.0 if team == "A" else -1.0
-    best = None
-    best_score = -1e9
-    for obj in state.get("visible_objects", []):
-        if obj.get("type") != "teammate" or obj.get("is_gk"):
-            continue
-        rel = obj.get("rel_angle", 0.0)
-        tm_abs = ori + rel
-        align = math.cos(math.radians(_rotate_toward(_attack_angle(team), tm_abs)))
-        if align < 0.3:
-            continue
-        # If we know our own position, prefer team-mates that are open (far
-        # from the nearest visible opponent) and far forward.
-        openness = 1.0
-        if agent_pos is not None:
-            tm_pos = _polar_to_global(agent_pos, ori,
-                                      obj.get("rel_distance", 1.0), rel)
-            forward = (tm_pos[0] - agent_pos[0]) * atk
-            opp_min = _nearest_opponent_dist(state, ori, agent_pos, tm_pos)
-            if opp_min < 3.0:
-                continue
-            openness = opp_min
-            score = forward * 1.0 + openness * 0.4
-        else:
-            score = obj.get("rel_distance", 0.0) * align
-        if score > best_score:
-            best_score = score
-            best = tm_abs % 360.0
-    return best
-
-
-def _visible_keeper_y(state: Dict[str, Any], ori: float,
-                      agent_pos: Point) -> Optional[float]:
-    for obj in state.get("visible_objects", []):
-        if obj.get("type") == "opponent" and obj.get("is_gk"):
-            gp = _polar_to_global(agent_pos, ori,
-                                  obj.get("rel_distance", 1.0),
-                                  obj.get("rel_angle", 0.0))
-            return gp[1]
-    return None
-
-
-def _nearest_opponent_dist(state: Dict[str, Any], ori: float,
-                           agent_pos: Point, target: Point) -> float:
-    best = 1e9
-    for obj in state.get("visible_objects", []):
-        if obj.get("type") != "opponent":
-            continue
-        op = _polar_to_global(agent_pos, ori,
-                              obj.get("rel_distance", 1.0),
-                              obj.get("rel_angle", 0.0))
-        best = min(best, distance(op, target))
-    return best
-
-
-if _TORCH:
-    class QNetwork(nn.Module):  # type: ignore[name-defined]
-        """MLP Q-network -- architecture must match ``train_rl_agent.py``."""
-
-        def __init__(self, state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM):
-            super().__init__()
-            self.fc = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, action_dim),
-)
-
-        def forward(self, x):  # type: ignore[override]
-            return self.fc(x)
-else:  # pragma: no cover - torch-less runtime
-    class QNetwork:  # type: ignore[no-redef]
-        """Placeholder so attribute lookups never fail when torch is absent."""
-
-        def __init__(self, *a, **k):
-            pass
-
-
-# ===========================================================================
-# 3.  The policy
-# ===========================================================================
-class Policy:
-    """Centralized team policy.
-
-    Holds a reference to its own ``squad`` (the live ``Agent`` objects the
-    engine mutates each tick).  Reading your own squad's positions/attributes
-    is proprioception -- explicitly permitted for a centralized policy (see the
-    README) -- and is what lets the team stay organized even when individual
-    agents momentarily can't see the ball in their vision cone.
-    """
-
-    def __init__(self, squad: Optional[List[Agent]] = None,
-                 seed: Optional[int] = None):
-        self.squad: List[Agent] = list(squad) if squad else []
-        self.rng = random.Random(seed)
-        self.state_dim = STATE_DIM
-        self.action_dim = ACTION_DIM
-        self.models: Dict[str, Any] = {}
-        self._load_models()
-
-    # ---- weight loading -------------------------------------------------
-    def _load_models(self) -> None:
-        """Load any trained DQN weights found next to this file / cwd."""
-        if not _TORCH:
-            return
-        module_dir = os.path.dirname(os.path.abspath(__file__))
-        for role in ("ATTACKER", "MIDFIELDER", "DEFENDER", "GK"):
-            for cand in (
-                f"{role.lower()}_dqn.pt",
-                os.path.join(module_dir, f"{role.lower()}_dqn.pt"),
-                os.path.join(module_dir, "..", f"{role.lower()}_dqn.pt"),
-            ):
-                if os.path.exists(cand):
-                    try:
-                        net = QNetwork(self.state_dim, self.action_dim)
-                        net.load_state_dict(
-                            torch.load(cand, map_location="cpu"))
-                        net.eval()
-                        self.models[role] = net
-                        print(f"[policy] loaded trained model for {role}: {cand}")
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"[policy] failed to load {cand}: {exc!r}")
-                    break
-
-    # ---- main entry point ----------------------------------------------
-    def decide(self, states: List[Dict[str, Any]], team: str) -> List[Dict[str, Any]]:
-        actions: List[Dict[str, Any]] = []
-        # Re-sync the squad reference length (the engine never resizes a squad,
-        # but a stray policy created without a squad should still do something).
-        have_squad = bool(self.squad) and len(self.squad) == len(states)
-
-        # Team-level situational read (uses the squad's absolute positions).
-        ball = self._estimate_ball(states) if have_squad else None
-        carrier_idx = next((i for i, s in enumerate(states)
-                            if s.get("has_ball")), None)
-
-        for i, state in enumerate(states):
-            role = state.get("archetype", "MIDFIELDER")
-            model = self.models.get(role)
-
-            # 1) Trained network, if available for this role.
-            if model is not None and _TORCH:
-                try:
-                    feat = extract_features(state)
-                    with torch.no_grad():
-                        q = model(torch.FloatTensor(feat).unsqueeze(0))
-                        a_idx = int(torch.argmax(q).item())
-                    agent = self._agent(state)
-                    agent_pos = (agent.x, agent.y) if agent is not None else None
-                    sho = agent.sho if agent is not None else 5.0
-                    raw = map_action(a_idx, state, agent_pos, sho)
-                    actions.append(self._safeguard(raw, state, team, i, ball,
-                                                   carrier_idx, have_squad))
-                    continue
-                except Exception:  # noqa: BLE001 - never let inference crash a match
-                    pass
-
-            # 2) Heuristic fallback.
-            if state.get("is_gk"):
-                actions.append(self._goalkeeper(state, team, ball))
-            elif state.get("has_ball"):
-                actions.append(self._carrier(state, team, ball))
-            else:
-                actions.append(self._outfield(state, team, ball,
-                                              carrier_idx, i, have_squad))
-        return actions
-
-    # ---- situational helpers -------------------------------------------
-    def _estimate_ball(self, states: List[Dict[str, Any]]) -> Optional[Point]:
-        """Reconstruct the ball's global position from whoever currently sees
-        it (a team-mate, or the carrier whose ball sits at their feet)."""
-        best: Optional[Tuple[float, Point]] = None
-        for i, s in enumerate(states):
-            if i >= len(self.squad):
-                break
-            ag = self.squad[i]
-            for obj in s.get("visible_objects", []):
-                if obj.get("type") == "ball":
-                    gp = _polar_to_global((ag.x, ag.y), ag.orientation,
-                                          obj["rel_distance"], obj["rel_angle"])
-                    if best is None or obj["rel_distance"] < best[0]:
-                        best = (obj["rel_distance"], gp)
-        return best[1] if best else None
-
-    def _visible_globals(self, agent: Agent, state: Dict[str, Any],
-                         only_type: Optional[str] = None):
-        out = []
-        for obj in state.get("visible_objects", []):
-            if only_type is not None and obj.get("type") != only_type:
-                continue
-            gp = _polar_to_global((agent.x, agent.y), agent.orientation,
-                                  obj["rel_distance"], obj["rel_angle"])
-            out.append((obj, gp))
-        return out
-
-    # ---- anti-stationary safeguard for the DQN --------------------------
-    def _safeguard(self, action: Dict[str, Any], state: Dict[str, Any],
-                   team: str, i: int, ball: Optional[Point],
-                   carrier_idx: Optional[int], have_squad: bool) -> Dict[str, Any]:
-        """Prevent a poorly-trained network from parking players.
-
-        The carrier's choices are always trusted (it is the decision-maker
-        with the ball).  For every other outfield player, only MOVE actions
-        are trusted from the network -- a ROTATE (spinning on the spot) or a
-        SHOOT/PASS (a useless whiff without the ball, which also freezes the
-        agent for the tick via the movement-shot mutex) is replaced with the
-        heuristic's purposeful outfield decision (support the attack, chase a
-        loose ball, or hold shape).  This guarantees the team is never a
-        static cluster, no matter how under-trained the network is.
-        """
-        if state.get("is_gk") or state.get("has_ball"):
-            return action
-        at = action.get("action_type", "IDLE") if isinstance(action, dict) else "IDLE"
-        if at == "MOVE":
-            return action
-        # Replace any non-MOVE non-carrier choice (ROTATE/SHOOT/IDLE/...) with
-        # the heuristic outfield decision, which always translates the agent.
-        return self._outfield(state, team, ball, carrier_idx, i, have_squad)
-
-# ---- carrier --------------------------------------------------------
-def _carrier(self, state: Dict[str, Any], team: str,
-             ball: Optional[Point]) -> Dict[str, Any]:
-
-    agent = self._agent(state)
-    opp = _opp_goal(team)
-
-    if agent is None:
-        fwd = _attack_angle(team)
-        return {
-            "action_type": MOVE,
-            "move_direction": _compass(fwd),
-            "rotation_angle": _rotate_toward(
-                state.get("current_orientation", 0.0), fwd
-            ),
-            "shoot_power_percentage": 0.0,
-            "shoot_angle": 0.0,
-        }
-
-    own = (agent.x, agent.y)
-    goal_ang = angle_of_vector((opp[0] - own[0], opp[1] - own[1]))
-    d_goal = distance(own, opp)
-
-    opps = self._visible_globals(agent, state, only_type="opponent")
-
-    nearest = min((distance(own, p) for _, p in opps), default=999.0)
-    pressure = sum(distance(own, p) < C.TACKLE_RADIUS * 2.5 for _, p in opps)
-
-    # ---------------- SMART SHOOT ----------------
-
-    shoot_range = 16.0 + agent.sho * 1.25
-
-    if agent.is_star:
-        shoot_range += 3.0
-
-    if pressure >= 2 and d_goal > 12.0:
-        can_shoot = False
-    elif d_goal <= shoot_range:
-        if d_goal > 22.0:
-            can_shoot = nearest > C.TACKLE_RADIUS * 3.0
-        else:
-            can_shoot = True
-    else:
-        can_shoot = False
-
-    if can_shoot:
-        aim = self._aim_away_from_keeper(agent, state, opp)
-
-        return {
-            "action_type": SHOOT,
-            "move_direction": 0,
-            "rotation_angle": _rotate_toward(agent.orientation, aim),
-            "shoot_power_percentage":
-                _shot_power_for_distance(d_goal, agent.sho),
-            "shoot_angle": aim,
-        }
-
-    # ---------------- PASS ----------------
-
-    if pressure >= 2 or nearest < C.TACKLE_RADIUS * 1.8:
-
-        tgt = self._best_pass_target(agent, state, team)
-
-        if tgt is not None:
-
-            tp, _ = tgt
-
-            ang = angle_of_vector(
-                (
-                    tp[0] - own[0],
-                    tp[1] - own[1],
-                )
-            )
-
-            return {
-                "action_type": SHOOT,
-                "move_direction": 0,
-                "rotation_angle": _rotate_toward(
-                    agent.orientation,
-                    ang,
-                ),
-                "shoot_power_percentage":
-                    _kick_power_for_distance(
-                        distance(own, tp),
-                        agent.sho,
-                    ),
-                "shoot_angle": ang,
-            }
-
-    # ---------------- SMART DRIBBLE ----------------
-
-    best_dir = 0
-    best_score = -1e9
-
-    for d in range(8):
-
-        ang = d * 45
-
-        # Better dribblers take slightly larger touches
-        step = 3.0 + agent.drb * 0.4
-
-        dx, dy = vec_from_angle(ang, step)
-
-        nx = own[0] + dx
-        ny = own[1] + dy
-
-        score = 0.0
-
-        # ---------------- TEAM SUPPORT ----------------
-
-        for mate in self.squad:
-
-            if mate.id == agent.id:
-                continue
-
-            dmate = distance((nx, ny), (mate.x, mate.y))
-
-            if 6.0 < dmate < 20.0:
-                score += 20.0
-            elif dmate < 4.0:
-                score -= 80.0
-
-        # ---------------- GOAL ----------------
-
-        diff = abs((ang - goal_ang + 180.0) % 360.0 - 180.0)
-        score += (180.0 - diff)
-
-        score -= distance((nx, ny), opp)
-
-        # Reward actual forward progress
-        if team == "A":
-            score += (nx - own[0]) * 15.0
-        else:
-            score += (own[0] - nx) * 15.0
-
-        # ---------------- FIELD ----------------
-
-        if nx < 2.0 or nx > C.FIELD_X_MAX - 2.0:
-            score -= 500.0
-
-        if ny < 2.0 or ny > C.FIELD_Y_MAX - 2.0:
-            score -= 500.0
-
-        # ---------------- DEFENDERS ----------------
-
-        for _, p in opps:
-
-            d2 = distance((nx, ny), p)
-
-            # Smooth penalty instead of hard thresholds
-            score -= max(0.0, 8.0 - d2) ** 2 * 12.0
-
-        if score > best_score:
-            best_score = score
-            best_dir = d
-
-    return {
-        "action_type": MOVE,
-        "move_direction": best_dir,
-        "rotation_angle": _rotate_toward(
-            agent.orientation,
-            best_dir * 45,
-        ),
-        "shoot_power_percentage": 0.0,
-        "shoot_angle": 0.0,
-    }
-
-    def _aim_away_from_keeper(self, agent: Agent, state: Dict[str, Any],
-        opp_goal: Point) -> float:
-        own = (agent.x, agent.y)
-        center = angle_of_vector((opp_goal[0] - own[0], opp_goal[1] - own[1]))
-        gk_y = None
-        for obj, gp in self._visible_globals(agent, state, only_type="opponent"):
-            if obj.get("is_gk"):
-                gk_y = gp[1]
-                break
-        if gk_y is None:
-            return center
-        target_y = (C.GOAL_Y_MIN + 1.0) if gk_y > C.FIELD_CENTER_Y \
-            else (C.GOAL_Y_MAX - 1.0)
-        return angle_of_vector((opp_goal[0] - own[0], target_y - own[1]))
-
-    def _best_pass_target(self, agent: Agent, state: Dict[str, Any], team: str):
-
-    opp_goal = _opp_goal(team)
-    own = (agent.x, agent.y)
-    atk = 1.0 if team == "A" else -1.0
-
-    teammates = self._visible_globals(agent, state, only_type="teammate")
-    opponents = self._visible_globals(agent, state, only_type="opponent")
-
-    best_score = -1e9
-    best = None
-
-    for obj, gp in teammates:
-
-        # Never pass to goalkeeper
-        if obj.get("is_gk"):
-            continue
-
-        pass_dist = distance(own, gp)
-
-        # Ignore impossible passes
-        if pass_dist < 4.0 or pass_dist > 35.0:
-            continue
-
-        # Prefer forward passes
-        forward = (gp[0] - own[0]) * atk
-
-        if forward < 1.0:
-            continue
-
-        # Closest defender to receiver
-        nearest_opp = min(
-            (distance(gp, op) for _, op in opponents),
-            default=100.0,
-        )
-
-        # Receiver is too tightly marked
-        if nearest_opp < 2.5:
-            continue
-
-        # Number of nearby defenders
-        nearby = sum(
-            distance(gp, op) < 6.0
-            for _, op in opponents
-        )
-
-        # Prefer central receivers
-        center_bonus = 30.0 - abs(gp[1] - C.FIELD_CENTER_Y)
-
-        # Prefer players closer to goal
-        goal_progress = 100.0 - distance(gp, opp_goal)
-
-        # Slight preference for shorter passes
-        pass_bonus = max(0.0, 25.0 - pass_dist)
-
-        # ---------- Passing lane safety ----------
-        lane_penalty = 0.0
-
-        ox, oy = own
-        px, py = gp
-
-        vx = px - ox
-        vy = py - oy
-
-        denom = vx * vx + vy * vy
-
-        if denom > 1e-6:
-
-            for _, op in opponents:
-
-                ex, ey = op
-
-                t = (
-                    ((ex - ox) * vx + (ey - oy) * vy)
-                    / denom
-                )
-
-                if 0.0 < t < 1.0:
-
-                    projx = ox + t * vx
-                    projy = oy + t * vy
-
-                    d = distance((projx, projy), op)
-
-                    if d < 3.0:
-                        lane_penalty += (3.0 - d) * 30.0
-
-        score = (
-            forward * 5.0
-            + goal_progress * 0.45
-            + nearest_opp * 8.0
-            + center_bonus * 0.4
-            + pass_bonus * 0.8
-            - nearby * 25.0
-            - lane_penalty
-        )
-
-        if score > best_score:
-            best_score = score
-            best = (gp, obj.get("id"))
-
-    return best
-    # ---- non-carrier outfield ------------------------------------------
-    def _outfield(self, state: Dict[str, Any], team: str,
-                  ball: Optional[Point], carrier_idx: Optional[int], i: int,
-                  have_squad: bool) -> Dict[str, Any]:
-        agent = self._agent(state)
-
-        # No squad reference: chase the ball if we can see it, else drift
-        # forward (never just spin -- that is the bug this fixes).
-        if agent is None or not have_squad:
-            sec = self._nearest_ball_sector(state)
-            ori = state.get("current_orientation", 0.0)
-            if sec is not None and sec.get("distance") is not None:
-                target = ori + sec["center_angle"]
-                return {"action_type": MOVE, "move_direction": _compass(target),
-                        "rotation_angle": _rotate_toward(ori, target),
-                        "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-            # Ball not visible: drift toward the attack instead of spinning.
-            fwd = _attack_angle(team)
-            return {"action_type": MOVE, "move_direction": _compass(fwd),
-                    "rotation_angle": _rotate_toward(ori, fwd),
-                    "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-
-        own = (agent.x, agent.y)
-
-        # We have possession -> push into forward support.
-        if carrier_idx is not None:
-            target = self._support_position(agent, team)
-            return self._move_toward(agent, target)
-
-        # Loose ball -> the nearest out-fielder chases it.
-        if ball is not None:
-            nearest = min(range(len(self.squad)),
-                          key=lambda k: distance((self.squad[k].x, self.squad[k].y), ball)
-                          if not self.squad[k].is_gk else 1e9)
-            if i == nearest:
-                return self._move_toward(agent, ball)
-
-        # Otherwise hold a compact defensive shape between ball and own goal.
-        target = self._hold_position(agent, team, ball)
-        return self._move_toward(agent, target)
-
-    def _support_position(self, agent: Agent, team: str) -> Point:
-
-    atk = 1.0 if team == "A" else -1.0
-
-    carrier = None
-    for p in self.squad:
-        if p.has_ball:
-            carrier = p
+def _rand_attr(rng: random.Random, low: float = C.ATTR_MIN,
+             high: float = C.ATTR_MAX) -> float:
+    """Random attribute in [low, high] rounded to one decimal."""
+    return round(rng.uniform(low, high), 1)
+
+
+def _make_outfield(team: str, index: int, archetype: str,
+                   is_star: bool, rng: random.Random) -> Agent:
+    agent = Agent(
+        id=f"Team{team}_Player_{index + 1}",
+        team=team,
+        index=index,
+        archetype=archetype,
+        is_gk=False,
+    )
+
+    # Base random capabilities (Section 3 intro: "randomly initialized with
+    # base capabilities").
+    agent.sho = _rand_attr(rng)
+    agent.spd = _rand_attr(rng)
+    agent.def_ = _rand_attr(rng)
+    agent.pass_ = _rand_attr(rng)
+    agent.vis = round(rng.uniform(C.VIS_MIN, C.VIS_MAX), 1)
+
+    if is_star:
+        agent.is_star = True
+        boost_attr = ARCHETYPES[archetype]
+        # Peg the priority stat at maximum capacity (10.0).
+        setattr(agent, boost_attr, C.STAR_BOOST_VALUE)
+        # Guarantee an average rating >= 6.0 across the standard attributes.
+        _enforce_star_floor(agent)
+
+    return agent
+
+
+def _enforce_star_floor(agent: Agent) -> None:
+    """Raise the star player's other attributes until avg rating >= 6.0."""
+    while agent.average_rating() < C.STAR_AVG_MIN:
+        # Raise the weakest non-boosted outfield attribute.
+        attrs = ["sho", "spd", "def_", "pass_"]
+        # Skip the boosted attribute (already 10.0).
+        boost_attr = ARCHETYPES[agent.archetype]
+        candidates = [a for a in attrs if a != boost_attr]
+        weakest = min(candidates, key=lambda a: getattr(agent, a))
+        current = getattr(agent, weakest)
+        setattr(agent, weakest, min(C.ATTR_MAX, round(current + 0.5, 1)))
+        # Also widen vision if it is pulling the average down.
+        if agent.vis < C.VIS_MAX:
+            agent.vis = min(C.VIS_MAX, round(agent.vis + 5.0, 1))
+        if all(getattr(agent, a) >= C.ATTR_MAX for a in candidates):
             break
 
-    if carrier is None:
-        return (agent.home_x, agent.home_y)
 
-    # ---------- ROLE DEPENDENT ----------
+def _make_goalkeeper(team: str, index: int, rng: random.Random) -> Agent:
+    agent = Agent(
+        id=f"Team{team}_Player_{index + 1}",
+        team=team,
+        index=index,
+        archetype="GK",
+        is_gk=True,
+        ref=_rand_attr(rng),
+        pos=_rand_attr(rng),
+        pass_=_rand_attr(rng),
+        # Goalkeepers keep outfield attributes at neutral defaults.
+    )
+    return agent
 
-    if agent.archetype == "ATTACKER":
 
-        forward = 14.0 + agent.spd * 0.5
+def generate_squad(team: str, star_index: Optional[int] = None,
+                   rng: Optional[random.Random] = None) -> List[Agent]:
+    """Generate a full 11-agent squad for ``team`` ("A" or "B").
 
-        side = 10.0 if agent.home_y > carrier.y else -10.0
+    Exactly one outfield player is the designated star (Section 3.3).  Pass a
+    ``rng`` for reproducible rosters; if omitted the module-level RNG is used.
+    """
+    rng = rng if rng is not None else random
+    squad: List[Agent] = []
+    outfield_indices = [i for i, role in enumerate(FORMATION) if role != "GK"]
+    if star_index is None:
+        star_index = rng.choice(outfield_indices)
 
-    elif agent.archetype == "MIDFIELDER":
-
-        forward = 6.0
-
-        side = 6.0 if agent.home_y > carrier.y else -6.0
-
-    elif agent.archetype == "DEFENDER":
-
-        forward = -3.0
-
-        side = 4.0 if agent.home_y > carrier.y else -4.0
-
-    else:
-        forward = 0.0
-        side = 0.0
-
-    x = carrier.x + atk * forward
-    y = carrier.y + side
-
-    # Extra forward run for star attackers
-    if agent.is_star and agent.archetype == "ATTACKER":
-        x += atk * 3.0
-
-    # Prevent crowding
-    for p in self.squad:
-
-        if p.id == agent.id:
-            continue
-
-        if distance((x, y), (p.x, p.y)) < 4.0:
-
-            y += 4.0 if y >= p.y else -4.0
-
-    x = clamp(x, 8.0, C.FIELD_X_MAX - 8.0)
-    y = clamp(y, 6.0, C.FIELD_Y_MAX - 6.0)
-
-    return (x, y)
-    def _hold_position(self, agent: Agent, team: str,
-                       ball: Optional[Point]) -> Point:
-        if ball is None:
-            return (agent.home_x, agent.home_y)
-        y = clamp(agent.home_y + (ball[1] - agent.home_y) * 0.4,
-                  6.0, C.FIELD_Y_MAX - 6.0)
-        if team == "A":
-            x = clamp(min(agent.home_x, ball[0] - 8.0), 4.0, 45.0)
+    for i, role in enumerate(FORMATION):
+        if role == "GK":
+            squad.append(_make_goalkeeper(team, i, rng))
         else:
-            x = clamp(max(agent.home_x, ball[0] + 8.0),
-                      C.FIELD_X_MAX - 45.0, C.FIELD_X_MAX - 4.0)
-        return (x, y)
-
-    def _move_toward(self, agent: Agent, target: Point) -> Dict[str, Any]:
-        own = (agent.x, agent.y)
-        d = distance(own, target)
-        ang = angle_of_vector((target[0] - own[0], target[1] - own[1]))
-        if d < 0.6:
-            return {"action_type": IDLE, "move_direction": 0,
-                    "rotation_angle": _rotate_toward(agent.orientation, ang),
-                    "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-        return {"action_type": MOVE, "move_direction": _compass(ang),
-                "rotation_angle": _rotate_toward(agent.orientation, ang),
-                "shoot_power_percentage": 0.0, "shoot_angle": 0.0}
-
-    # ---- goalkeeper -----------------------------------------------------
-    def _goalkeeper(self, state: Dict[str, Any], team: str,
-                    ball: Optional[Point]) -> Dict[str, Any]:
-        if state.get("cooldown_remaining", 0) > 0:
-            return {"action_type": IDLE}
-        agent = self._agent(state)
-        # A keeper always knows its own goal-line position.
-        gy = state.get("gk_y", 30.0)
-        gx = state.get("gk_x", (_own_goal(team)[0] + (3.0 if team == "A" else -3.0)))
-        own = (gx, gy)
-        target_y = clamp(ball[1] if ball else C.FIELD_CENTER_Y,
-                         C.GOAL_Y_MIN - 1.0, C.GOAL_Y_MAX + 1.0)
-        dy = target_y - gy
-
-        # Distribute if the keeper has the ball.
-        if state.get("has_ball") and agent is not None:
-            tgt = self._best_pass_target(agent, state, team)
-            if tgt is not None:
-                tp, _ = tgt
-                ang = angle_of_vector((tp[0] - own[0], tp[1] - own[1]))
-                return {"action_type": SHOOT, "move_direction": 0,
-                        "rotation_angle": _rotate_toward(state.get("current_orientation", 0.0), ang),
-                        "shoot_power_percentage": _kick_power_for_distance(distance(own, tp), agent.sho),
-                        "shoot_angle": ang}
-            fwd = _attack_angle(team)
-            return {"action_type": SHOOT, "move_direction": 0,
-                    "rotation_angle": _rotate_toward(state.get("current_orientation", 0.0), fwd),
-                    "shoot_power_percentage": 1.0, "shoot_angle": fwd}
-
-        # Dive if a ball is bearing down on the goal.
-        if ball is not None:
-            og = _own_goal(team)
-            on_side = (ball[0] < 20.0 and team == "A") or \
-                      (ball[0] > 80.0 and team == "B")
-            if on_side and distance(ball, og) < 14.0 and abs(dy) > 2.0:
-                move_dir = 0 if (dy > 0 and team == "A") or (dy < 0 and team == "B") else 1
-                return {"action_type": DIVE, "move_direction": move_dir,
-                        "deflect_angle": _attack_angle(team)}
-
-        # Otherwise shuffle along the goal line to track the ball.
-        if abs(dy) < 0.5:
-            return {"action_type": IDLE, "move_direction": 0,
-                    "rotation_angle": 0.0, "shoot_power_percentage": 0.0,
-                    "shoot_angle": 0.0, "deflect_angle": _attack_angle(team)}
-        move_dir = 0 if (dy > 0 and team == "A") or (dy < 0 and team == "B") else 1
-        return {"action_type": MOVE, "move_direction": move_dir,
-                "rotation_angle": 0.0, "shoot_power_percentage": 0.0,
-                "shoot_angle": 0.0, "deflect_angle": _attack_angle(team)}
-
-    # ---- small utilities ------------------------------------------------
-    def _agent(self, state: Dict[str, Any]) -> Optional[Agent]:
-        sid = state.get("self_id")
-        for a in self.squad:
-            if a.id == sid:
-                return a
-        return None
-
-    @staticmethod
-    def _nearest_ball_sector(state: Dict[str, Any]):
-        for s in state.get("vision_sectors", []):
-            if s.get("type") == "ball":
-                return s
-        return None
+            squad.append(_make_outfield(team, i, role, is_star=(i == star_index),
+                                        rng=rng))
+    return squad
 
 
-# ===========================================================================
-# 4.  Factory (the engine's only import from this module)
-# ===========================================================================
-def make_policy(squad: Optional[List[Agent]] = None,
-                seed: Optional[int] = None) -> Policy:
-    """Factory hook imported by the engine / tournament."""
-    return Policy(squad=squad, seed=seed)
+# ---------------------------------------------------------------------------
+# Kickoff formation
+# ---------------------------------------------------------------------------
+# Formation coordinates for Team A (attacking East, defending X=0).
+# Team B is mirrored horizontally about the centre line (x -> 100 - x).
+_TEAM_A_FORMATION = [
+    # (index, x, y)   - GK + 4-3-3
+    (0,  3.0, 30.0),    # GK
+    (1, 18.0, 12.0),    # LB
+    (2, 18.0, 24.0),    # CB
+    (3, 18.0, 36.0),    # CB
+    (4, 18.0, 48.0),    # RB
+    (5, 35.0, 18.0),    # LM
+    (6, 35.0, 30.0),    # CM
+    (7, 35.0, 42.0),    # RM
+    (8, 45.0, 20.0),    # LW
+    (9, 47.0, 30.0),    # ST
+    (10, 45.0, 40.0),   # RW
+]
+
+
+def place_kickoff(squad: List[Agent], team: str) -> None:
+    """Position a squad in its kickoff configuration and reset dynamic state.
+
+    A squad built from a participant's custom formation (``home_set``) is
+    restored to those home positions; otherwise the built-in default 4-3-3 is
+    applied (and becomes each agent's home).
+    """
+    if squad and all(a.home_set for a in squad):
+        for agent in squad:
+            agent.x, agent.y = agent.home_x, agent.home_y
+            agent.reset_dynamic_state()
+        return
+
+    for idx, x, y in _TEAM_A_FORMATION:
+        agent = squad[idx]
+        if team == "A":
+            agent.x, agent.y = x, y
+        else:
+            # Mirror horizontally about the centre line.
+            agent.x, agent.y = C.FIELD_X_MAX - x, y
+        agent.home_x, agent.home_y = agent.x, agent.y
+        agent.reset_dynamic_state()
+
+
+def squad_value(squad: List[Agent]) -> int:
+    """Transfer-market value of a squad (star = 200, others = 100)."""
+    return sum(C.STAR_PLAYER_COST if a.is_star else C.NORMAL_PLAYER_COST
+               for a in squad)
