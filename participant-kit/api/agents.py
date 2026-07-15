@@ -359,12 +359,12 @@ if _TORCH:
         def __init__(self, state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM):
             super().__init__()
             self.fc = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, action_dim),
-)
+                nn.Linear(state_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 128),
+                nn.ReLU(),
+                nn.Linear(128, action_dim),
+            )
 
         def forward(self, x):  # type: ignore[override]
             return self.fc(x)
@@ -517,175 +517,127 @@ class Policy:
         # the heuristic outfield decision, which always translates the agent.
         return self._outfield(state, team, ball, carrier_idx, i, have_squad)
 
-# ---- carrier --------------------------------------------------------
-def _carrier(self, state: Dict[str, Any], team: str,
-             ball: Optional[Point]) -> Dict[str, Any]:
+    # ---- carrier ---------------------------------------------------------
+    def _carrier(self, state: Dict[str, Any], team: str,
+                ball: Optional[Point]) -> Dict[str, Any]:
+        agent = self._agent(state)
+        opp = _opp_goal(team)
 
-    agent = self._agent(state)
-    opp = _opp_goal(team)
+        if agent is None:
+            fwd = _attack_angle(team)
+            return {
+                "action_type": MOVE,
+                "move_direction": _compass(fwd),
+                "rotation_angle": _rotate_toward(
+                    state.get("current_orientation", 0.0), fwd),
+                "shoot_power_percentage": 0.0,
+                "shoot_angle": 0.0,
+            }
 
-    if agent is None:
-        fwd = _attack_angle(team)
+        own = (agent.x, agent.y)
+        goal_ang = angle_of_vector((opp[0] - own[0], opp[1] - own[1]))
+        d_goal = distance(own, opp)
+
+        opps = self._visible_globals(agent, state, only_type="opponent")
+        nearest = min((distance(own, p) for _, p in opps), default=999.0)
+        pressure = sum(distance(own, p) < C.TACKLE_RADIUS * 2.5 for _, p in opps)
+
+        # ---------------- SMART SHOOT ----------------
+        shoot_range = 16.0 + agent.sho * 1.25
+        if agent.is_star:
+            shoot_range += 3.0
+
+        if pressure >= 2 and d_goal > 12.0:
+            can_shoot = False
+        elif d_goal <= shoot_range:
+            if d_goal > 22.0:
+                can_shoot = nearest > C.TACKLE_RADIUS * 3.0
+            else:
+                can_shoot = True
+        else:
+            can_shoot = False
+
+        if can_shoot:
+            aim = self._aim_away_from_keeper(agent, state, opp)
+            return {
+                "action_type": SHOOT,
+                "move_direction": 0,
+                "rotation_angle": _rotate_toward(agent.orientation, aim),
+                "shoot_power_percentage": _shot_power_for_distance(d_goal, agent.sho),
+                "shoot_angle": aim,
+            }
+
+        # ---------------- PASS ----------------
+        if pressure >= 2 or nearest < C.TACKLE_RADIUS * 1.8:
+            tgt = self._best_pass_target(agent, state, team)
+            if tgt is not None:
+                tp, _ = tgt
+                ang = angle_of_vector((tp[0] - own[0], tp[1] - own[1]))
+                return {
+                    "action_type": SHOOT,
+                    "move_direction": 0,
+                    "rotation_angle": _rotate_toward(agent.orientation, ang),
+                    "shoot_power_percentage": _kick_power_for_distance(
+                        distance(own, tp), agent.sho),
+                    "shoot_angle": ang,
+                }
+
+        # ---------------- SMART DRIBBLE ----------------
+        best_dir = 0
+        best_score = -1e9
+        for d in range(8):
+            ang = d * 45
+            step = 3.0 + agent.drb * 0.4  # better dribblers take bigger touches
+            dx, dy = vec_from_angle(ang, step)
+            nx, ny = own[0] + dx, own[1] + dy
+            score = 0.0
+
+            # ---------------- TEAM SUPPORT ----------------
+            for mate in self.squad:
+                if mate.id == agent.id:
+                    continue
+                dmate = distance((nx, ny), (mate.x, mate.y))
+                if 6.0 < dmate < 20.0:
+                    score += 20.0
+                elif dmate < 4.0:
+                    score -= 80.0
+
+            # ---------------- GOAL ----------------
+            diff = abs((ang - goal_ang + 180.0) % 360.0 - 180.0)
+            score += (180.0 - diff)
+            score -= distance((nx, ny), opp)
+
+            # Reward actual forward progress
+            if team == "A":
+                score += (nx - own[0]) * 15.0
+            else:
+                score += (own[0] - nx) * 15.0
+
+            # ---------------- FIELD ----------------
+            if nx < 2.0 or nx > C.FIELD_X_MAX - 2.0:
+                score -= 500.0
+            if ny < 2.0 or ny > C.FIELD_Y_MAX - 2.0:
+                score -= 500.0
+
+            # ---------------- DEFENDERS ----------------
+            for _, p in opps:
+                d2 = distance((nx, ny), p)
+                score -= max(0.0, 8.0 - d2) ** 2 * 12.0  # smooth penalty
+
+            if score > best_score:
+                best_score = score
+                best_dir = d
+
         return {
             "action_type": MOVE,
-            "move_direction": _compass(fwd),
-            "rotation_angle": _rotate_toward(
-                state.get("current_orientation", 0.0), fwd
-            ),
+            "move_direction": best_dir,
+            "rotation_angle": _rotate_toward(agent.orientation, best_dir * 45),
             "shoot_power_percentage": 0.0,
             "shoot_angle": 0.0,
         }
 
-    own = (agent.x, agent.y)
-    goal_ang = angle_of_vector((opp[0] - own[0], opp[1] - own[1]))
-    d_goal = distance(own, opp)
-
-    opps = self._visible_globals(agent, state, only_type="opponent")
-
-    nearest = min((distance(own, p) for _, p in opps), default=999.0)
-    pressure = sum(distance(own, p) < C.TACKLE_RADIUS * 2.5 for _, p in opps)
-
-    # ---------------- SMART SHOOT ----------------
-
-    shoot_range = 16.0 + agent.sho * 1.25
-
-    if agent.is_star:
-        shoot_range += 3.0
-
-    if pressure >= 2 and d_goal > 12.0:
-        can_shoot = False
-    elif d_goal <= shoot_range:
-        if d_goal > 22.0:
-            can_shoot = nearest > C.TACKLE_RADIUS * 3.0
-        else:
-            can_shoot = True
-    else:
-        can_shoot = False
-
-    if can_shoot:
-        aim = self._aim_away_from_keeper(agent, state, opp)
-
-        return {
-            "action_type": SHOOT,
-            "move_direction": 0,
-            "rotation_angle": _rotate_toward(agent.orientation, aim),
-            "shoot_power_percentage":
-                _shot_power_for_distance(d_goal, agent.sho),
-            "shoot_angle": aim,
-        }
-
-    # ---------------- PASS ----------------
-
-    if pressure >= 2 or nearest < C.TACKLE_RADIUS * 1.8:
-
-        tgt = self._best_pass_target(agent, state, team)
-
-        if tgt is not None:
-
-            tp, _ = tgt
-
-            ang = angle_of_vector(
-                (
-                    tp[0] - own[0],
-                    tp[1] - own[1],
-                )
-            )
-
-            return {
-                "action_type": SHOOT,
-                "move_direction": 0,
-                "rotation_angle": _rotate_toward(
-                    agent.orientation,
-                    ang,
-                ),
-                "shoot_power_percentage":
-                    _kick_power_for_distance(
-                        distance(own, tp),
-                        agent.sho,
-                    ),
-                "shoot_angle": ang,
-            }
-
-    # ---------------- SMART DRIBBLE ----------------
-
-    best_dir = 0
-    best_score = -1e9
-
-    for d in range(8):
-
-        ang = d * 45
-
-        # Better dribblers take slightly larger touches
-        step = 3.0 + agent.drb * 0.4
-
-        dx, dy = vec_from_angle(ang, step)
-
-        nx = own[0] + dx
-        ny = own[1] + dy
-
-        score = 0.0
-
-        # ---------------- TEAM SUPPORT ----------------
-
-        for mate in self.squad:
-
-            if mate.id == agent.id:
-                continue
-
-            dmate = distance((nx, ny), (mate.x, mate.y))
-
-            if 6.0 < dmate < 20.0:
-                score += 20.0
-            elif dmate < 4.0:
-                score -= 80.0
-
-        # ---------------- GOAL ----------------
-
-        diff = abs((ang - goal_ang + 180.0) % 360.0 - 180.0)
-        score += (180.0 - diff)
-
-        score -= distance((nx, ny), opp)
-
-        # Reward actual forward progress
-        if team == "A":
-            score += (nx - own[0]) * 15.0
-        else:
-            score += (own[0] - nx) * 15.0
-
-        # ---------------- FIELD ----------------
-
-        if nx < 2.0 or nx > C.FIELD_X_MAX - 2.0:
-            score -= 500.0
-
-        if ny < 2.0 or ny > C.FIELD_Y_MAX - 2.0:
-            score -= 500.0
-
-        # ---------------- DEFENDERS ----------------
-
-        for _, p in opps:
-
-            d2 = distance((nx, ny), p)
-
-            # Smooth penalty instead of hard thresholds
-            score -= max(0.0, 8.0 - d2) ** 2 * 12.0
-
-        if score > best_score:
-            best_score = score
-            best_dir = d
-
-    return {
-        "action_type": MOVE,
-        "move_direction": best_dir,
-        "rotation_angle": _rotate_toward(
-            agent.orientation,
-            best_dir * 45,
-        ),
-        "shoot_power_percentage": 0.0,
-        "shoot_angle": 0.0,
-    }
-
     def _aim_away_from_keeper(self, agent: Agent, state: Dict[str, Any],
-        opp_goal: Point) -> float:
+                              opp_goal: Point) -> float:
         own = (agent.x, agent.y)
         center = angle_of_vector((opp_goal[0] - own[0], opp_goal[1] - own[1]))
         gk_y = None
@@ -700,107 +652,69 @@ def _carrier(self, state: Dict[str, Any], team: str,
         return angle_of_vector((opp_goal[0] - own[0], target_y - own[1]))
 
     def _best_pass_target(self, agent: Agent, state: Dict[str, Any], team: str):
+        opp_goal = _opp_goal(team)
+        own = (agent.x, agent.y)
+        atk = 1.0 if team == "A" else -1.0
 
-    opp_goal = _opp_goal(team)
-    own = (agent.x, agent.y)
-    atk = 1.0 if team == "A" else -1.0
+        teammates = self._visible_globals(agent, state, only_type="teammate")
+        opponents = self._visible_globals(agent, state, only_type="opponent")
 
-    teammates = self._visible_globals(agent, state, only_type="teammate")
-    opponents = self._visible_globals(agent, state, only_type="opponent")
+        best_score = -1e9
+        best = None
 
-    best_score = -1e9
-    best = None
+        for obj, gp in teammates:
+            if obj.get("is_gk"):
+                continue  # never pass to the goalkeeper
 
-    for obj, gp in teammates:
+            pass_dist = distance(own, gp)
+            if pass_dist < 4.0 or pass_dist > 35.0:
+                continue  # ignore impossible passes
 
-        # Never pass to goalkeeper
-        if obj.get("is_gk"):
-            continue
+            forward = (gp[0] - own[0]) * atk
+            if forward < 1.0:
+                continue  # prefer forward passes
 
-        pass_dist = distance(own, gp)
+            nearest_opp = min((distance(gp, op) for _, op in opponents), default=100.0)
+            if nearest_opp < 2.5:
+                continue  # receiver is too tightly marked
 
-        # Ignore impossible passes
-        if pass_dist < 4.0 or pass_dist > 35.0:
-            continue
+            nearby = sum(distance(gp, op) < 6.0 for _, op in opponents)
+            center_bonus = 30.0 - abs(gp[1] - C.FIELD_CENTER_Y)
+            goal_progress = 100.0 - distance(gp, opp_goal)
+            pass_bonus = max(0.0, 25.0 - pass_dist)
 
-        # Prefer forward passes
-        forward = (gp[0] - own[0]) * atk
+            # ---------- Passing lane safety ----------
+            lane_penalty = 0.0
+            ox, oy = own
+            px, py = gp
+            vx, vy = px - ox, py - oy
+            denom = vx * vx + vy * vy
+            if denom > 1e-6:
+                for _, op in opponents:
+                    ex, ey = op
+                    t = ((ex - ox) * vx + (ey - oy) * vy) / denom
+                    if 0.0 < t < 1.0:
+                        projx, projy = ox + t * vx, oy + t * vy
+                        d = distance((projx, projy), op)
+                        if d < 3.0:
+                            lane_penalty += (3.0 - d) * 30.0
 
-        if forward < 1.0:
-            continue
+            score = (
+                forward * 5.0
+                + goal_progress * 0.45
+                + nearest_opp * 8.0
+                + center_bonus * 0.4
+                + pass_bonus * 0.8
+                - nearby * 25.0
+                - lane_penalty
+            )
 
-        # Closest defender to receiver
-        nearest_opp = min(
-            (distance(gp, op) for _, op in opponents),
-            default=100.0,
-        )
+            if score > best_score:
+                best_score = score
+                best = (gp, obj.get("id"))
 
-        # Receiver is too tightly marked
-        if nearest_opp < 2.5:
-            continue
+        return best
 
-        # Number of nearby defenders
-        nearby = sum(
-            distance(gp, op) < 6.0
-            for _, op in opponents
-        )
-
-        # Prefer central receivers
-        center_bonus = 30.0 - abs(gp[1] - C.FIELD_CENTER_Y)
-
-        # Prefer players closer to goal
-        goal_progress = 100.0 - distance(gp, opp_goal)
-
-        # Slight preference for shorter passes
-        pass_bonus = max(0.0, 25.0 - pass_dist)
-
-        # ---------- Passing lane safety ----------
-        lane_penalty = 0.0
-
-        ox, oy = own
-        px, py = gp
-
-        vx = px - ox
-        vy = py - oy
-
-        denom = vx * vx + vy * vy
-
-        if denom > 1e-6:
-
-            for _, op in opponents:
-
-                ex, ey = op
-
-                t = (
-                    ((ex - ox) * vx + (ey - oy) * vy)
-                    / denom
-                )
-
-                if 0.0 < t < 1.0:
-
-                    projx = ox + t * vx
-                    projy = oy + t * vy
-
-                    d = distance((projx, projy), op)
-
-                    if d < 3.0:
-                        lane_penalty += (3.0 - d) * 30.0
-
-        score = (
-            forward * 5.0
-            + goal_progress * 0.45
-            + nearest_opp * 8.0
-            + center_bonus * 0.4
-            + pass_bonus * 0.8
-            - nearby * 25.0
-            - lane_penalty
-        )
-
-        if score > best_score:
-            best_score = score
-            best = (gp, obj.get("id"))
-
-    return best
     # ---- non-carrier outfield ------------------------------------------
     def _outfield(self, state: Dict[str, Any], team: str,
                   ball: Optional[Point], carrier_idx: Optional[int], i: int,
@@ -843,63 +757,49 @@ def _carrier(self, state: Dict[str, Any], team: str,
         return self._move_toward(agent, target)
 
     def _support_position(self, agent: Agent, team: str) -> Point:
+        atk = 1.0 if team == "A" else -1.0
 
-    atk = 1.0 if team == "A" else -1.0
+        carrier = None
+        for p in self.squad:
+            if p.has_ball:
+                carrier = p
+                break
 
-    carrier = None
-    for p in self.squad:
-        if p.has_ball:
-            carrier = p
-            break
+        if carrier is None:
+            return (agent.home_x, agent.home_y)
 
-    if carrier is None:
-        return (agent.home_x, agent.home_y)
+        # ---------- ROLE DEPENDENT ----------
+        if agent.archetype == "ATTACKER":
+            forward = 14.0 + agent.spd * 0.5
+            side = 10.0 if agent.home_y > carrier.y else -10.0
+        elif agent.archetype == "MIDFIELDER":
+            forward = 6.0
+            side = 6.0 if agent.home_y > carrier.y else -6.0
+        elif agent.archetype == "DEFENDER":
+            forward = -3.0
+            side = 4.0 if agent.home_y > carrier.y else -4.0
+        else:
+            forward = 0.0
+            side = 0.0
 
-    # ---------- ROLE DEPENDENT ----------
+        x = carrier.x + atk * forward
+        y = carrier.y + side
 
-    if agent.archetype == "ATTACKER":
+        # Extra forward run for star attackers
+        if agent.is_star and agent.archetype == "ATTACKER":
+            x += atk * 3.0
 
-        forward = 14.0 + agent.spd * 0.5
+        # Prevent crowding
+        for p in self.squad:
+            if p.id == agent.id:
+                continue
+            if distance((x, y), (p.x, p.y)) < 4.0:
+                y += 4.0 if y >= p.y else -4.0
 
-        side = 10.0 if agent.home_y > carrier.y else -10.0
+        x = clamp(x, 8.0, C.FIELD_X_MAX - 8.0)
+        y = clamp(y, 6.0, C.FIELD_Y_MAX - 6.0)
+        return (x, y)
 
-    elif agent.archetype == "MIDFIELDER":
-
-        forward = 6.0
-
-        side = 6.0 if agent.home_y > carrier.y else -6.0
-
-    elif agent.archetype == "DEFENDER":
-
-        forward = -3.0
-
-        side = 4.0 if agent.home_y > carrier.y else -4.0
-
-    else:
-        forward = 0.0
-        side = 0.0
-
-    x = carrier.x + atk * forward
-    y = carrier.y + side
-
-    # Extra forward run for star attackers
-    if agent.is_star and agent.archetype == "ATTACKER":
-        x += atk * 3.0
-
-    # Prevent crowding
-    for p in self.squad:
-
-        if p.id == agent.id:
-            continue
-
-        if distance((x, y), (p.x, p.y)) < 4.0:
-
-            y += 4.0 if y >= p.y else -4.0
-
-    x = clamp(x, 8.0, C.FIELD_X_MAX - 8.0)
-    y = clamp(y, 6.0, C.FIELD_Y_MAX - 6.0)
-
-    return (x, y)
     def _hold_position(self, agent: Agent, team: str,
                        ball: Optional[Point]) -> Point:
         if ball is None:
